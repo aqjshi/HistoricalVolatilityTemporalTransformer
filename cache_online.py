@@ -29,11 +29,12 @@ try:
     HTML_ATTRIBUTE_STOP_WORDS = set(data['naive_stopwords'])
     print(f"Loaded {len(HTML_ATTRIBUTE_STOP_WORDS)} existing noise words from cache.")
 except FileNotFoundError:
-    print("Error: stopwords.json not found.")
-    sys.exit(1)
+    # Handle the case where the file is missing by starting with an empty set
+    HTML_ATTRIBUTE_STOP_WORDS = set() 
+    print("Warning: stopwords.json not found. Starting with empty existing noise words set.")
 except KeyError:
-    print("Error: 'naive_stopwords' key not found in stopwords.json.")
-    sys.exit(1)
+    print("Error: 'naive_stopwords' key not found in stopwords.json. Starting with empty set.")
+    HTML_ATTRIBUTE_STOP_WORDS = set()
 
 
 # --- 2. Worker Functions ---
@@ -97,29 +98,71 @@ def extract_potential_noise_words(raw_html, existing_stopwords):
     return new_noise_words
 
 
-def print_frequency_report(title, counter, total_tokens):
-    """Helper function to print a formatted top-50 report."""
+def print_frequency_report(title, counter, df_counter, total_documents, total_tokens, output_filename=None):
+    """
+    Helper function to print a formatted report and calculate/cache TF-IDF scores.
+    Uses simplified TF-IDF formula for noise: TF * log(N / DF).
+    """
     print(f"\n{title}")
-    print("-" * 40)
+    print("-" * 75)
     
     if total_tokens == 0:
-        print("No new noise tokens found in this batch.")
-        print("-" * 40)
+        print("No new noise tokens found.")
+        print("-" * 75)
         return
 
+    print(f"Total documents (N): {total_documents}")
     print(f"Total new noise tokens: {total_tokens}")
-    top_k = 50
-    top_items = counter.most_common(top_k)
+    top_k = 500
     
-    print(f"\nTop {top_k} new noise words (candidates to add to stopwords):")
-    print(f"{'Rank':<5} {'Word':<20} {'Count':<8} {'Frequency':<10}")
-    print(f"{'-'*4:<5} {'-'*19:<20} {'-'*7:<8} {'-'*9:<10}")
+    # 1. Calculate TF-IDF Score
+    noise_scores = {}
     
-    for i, (word, count) in enumerate(top_items, 1):
-        pct = (count / total_tokens) * 100
-        print(f"{i:<5} {word:<20} {count:<8} {pct:>8.2f}%")
-    print("-" * 40)
+    for word, count in counter.items():
+        tf = count          # Term Frequency (Count in our corpus of noise words)
+        df = df_counter[word] # Document Frequency (Number of documents it appeared in)
+        
+        # IDF formula: log(Total Documents / Document Frequency)
+        # Use log(N / (DF + 1)) to prevent division by zero and smooth the score
+        idf = math.log(total_documents / (df + 1)) 
+        
+        # TF-IDF Score
+        score = tf * idf
+        noise_scores[word] = score
 
+    # Sort items by TF-IDF score
+    top_items = sorted(noise_scores.items(), key=lambda item: item[1], reverse=True)
+    top_k_items = top_items[:top_k]
+
+    # 2. Print Report
+    print(f"\nTop {top_k} new noise words (ranked by TF-IDF Score):")
+    print(f"{'Rank':<5} {'Word':<20} {'Count':<8} {'DF':<5} {'TF-IDF Score':<15} {'Frequency':<10}")
+    print(f"{'-'*4:<5} {'-'*19:<20} {'-'*7:<8} {'-'*4:<5} {'-'*14:<15} {'-'*9:<10}")
+    
+    for i, (word, score) in enumerate(top_k_items, 1):
+        count = counter[word]
+        df = df_counter[word]
+        pct = (count / total_tokens) * 100
+        print(f"{i:<5} {word:<20} {count:<8} {df:<5} {score:<15.4f} {pct:>8.2f}%")
+    print("-" * 75)
+
+    # 3. Cache Noise Scores to JSON
+    if output_filename:
+        # Prepare data for caching (Word: TF-IDF Score)
+        cache_data = {word: score for word, score in top_items}
+        
+        try:
+            with open(output_filename, 'w') as f:
+                json.dump(cache_data, f, indent=4)
+            print(f"✅ TF-IDF noise scores (all {len(top_items)} words) cached to: {output_filename}")
+        except Exception as e:
+            print(f"Error saving noise cache to {output_filename}: {e}")
+
+    # Print the comma-separated list of top words
+    formatted_items = [f"\"{name}\"" for name, score in top_k_items]
+    print("\nTop words (for easy copy/paste):")
+    print(", ".join(formatted_items))
+    print("-" * 75)
 
 
 # --- 3. Main Execution ---
@@ -127,6 +170,7 @@ def print_frequency_report(title, counter, total_tokens):
 if __name__ == "__main__":
     
     parquet_file = "NEWS_20240101-142500_20251101-232422.parquet"
+    NOISE_CACHE_FILE = "noise_tfidf_scores.json"
 
     try:
         df = pd.read_parquet(parquet_file)
@@ -140,16 +184,18 @@ if __name__ == "__main__":
     print(df_sorted["url"].head())
     
     # --- Batch Config ---
-    BATCH_SIZE = 1000  # Number of *new* items to add per batch
-    MAX_WORKERS = 20   # Number of concurrent download threads
+    BATCH_SIZE = 2000  # Number of *new* items to add per batch
+    MAX_WORKERS = 32  # Number of concurrent download threads
     MAX_RETRIES = 2    # Max *retries* (so 3 attempts total: 0, 1, 2)
     
     # Holds (idx, url, retry_count) tuples
     pending_items = [] 
     
-    # Aggregate counter for *new noise words*
-    aggregate_noise_counter = Counter()
+    # Aggregate counters for *new noise words*
+    aggregate_noise_counter = Counter() # Holds Term Frequency (TF)
+    document_frequency_counter = Counter() # Holds Document Frequency (DF)
     total_aggregate_noise_tokens = 0
+    total_processed_documents = 0 # N for IDF calculation
 
     total_rows = len(df_sorted)
     num_batches = math.ceil(total_rows / BATCH_SIZE)
@@ -213,27 +259,33 @@ if __name__ == "__main__":
                     batch_noise_counter.update(new_noise)
                     total_batch_noise_tokens += len(new_noise)
                     
-                    # Update aggregate counters
+                    # Update aggregate counters (TF)
                     aggregate_noise_counter.update(new_noise)
                     total_aggregate_noise_tokens += len(new_noise)
+
+                    # Update document frequency (DF) for this document's unique noise words
+                    document_frequency_counter.update(set(new_noise))
+                    
+                    # Increment total processed documents (N)
+                    total_processed_documents += 1
                     
             except Exception as e:
                 print(f"Error cleaning {url} (idx {idx}): {e}")
         
-        # --- 4. Print Per-Batch Report ---
-        print_frequency_report(
-            f"--- Batch {i+1} Noise Report ---",
-            batch_noise_counter,
-            total_batch_noise_tokens
-        )
-
+        # --- 4. Print Per-Batch Report (Optional, can be removed for speed) ---
+        # The key accumulation happens above. We only run the full TF-IDF report at the end.
+        
+        
     if pending_items:
         print(f"\n--- WARNING ---")
         print(f"{len(pending_items)} URLs failed all attempts and were not processed.")
 
+    # --- 5. Final Report and Caching ---
     print_frequency_report(
-        "=== Final Aggregate Noise Report (All Batches) ===",
+        "=== Final Aggregate Noise Report (All Batches - TF-IDF Score) ===",
         aggregate_noise_counter,
-        total_aggregate_noise_tokens
+        document_frequency_counter,
+        total_processed_documents,
+        total_aggregate_noise_tokens,
+        output_filename=NOISE_CACHE_FILE # Pass the filename to save the scores
     )
-
