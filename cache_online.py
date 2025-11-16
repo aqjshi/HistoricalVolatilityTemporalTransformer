@@ -1,134 +1,36 @@
 import pandas as pd
 import pyarrow 
 import sys
-
-parquet_file = "NEWS_20240101-142500_20251101-232422.parquet"
-
-df = pd.read_parquet(parquet_file)
-
-
-df_sorted = df.sort_values(by='time_published_ts', ascending=True)
-
-print(df_sorted["url"].head())
-
+import json
 import re
 import os
-import requests # <-- ADDED: For fetching the URL content
+import requests 
 import nltk
 from nltk.corpus import words
 
 try:
     nltk.data.find('corpora/words')
-except nltk.downloader.DownloadError:
+except:
     print("Downloading 'words' corpus for dictionary check...")
     nltk.download('words')
 
-# Convert the list of words to a set for fast lookup (O(1) complexity)
 ENGLISH_WORDS = set(words.words())
 TICKER_SYMBOLS = {"meta", "amd", "aapl", "msft", "tsla", "nvda"}
-HTML_ATTRIBUTE_STOP_WORDS = {
-    # Layout & Structure
-    "div", "span", "row", "col", "container", "wrapper", "header", "footer", 
-    "nav", "sidebar", "main", "content", "section", "article",
-    
-    # State & Visibility
-    "active", "current", "hidden", "show", "toggle", "open", "close", 
-    "disabled", "selected", "has", 
-    
-    # Position & Spacing
-    "top", "bottom", "left", "right", "center", "float", "margin", 
-    "padding", "space", "block", "inline", "pull", 
-    
-    # Visual & Theme
-    "default", "primary", "secondary", "light", "dark", "white", "black", 
-    "gray", "red", "blue", "green", "transparent", 
-    
-    # Responsiveness
-    "sm", "md", "lg", "xl", "mobile", "desktop", "tablet", "screen", "print", 
-    
-    # Utility & Icons
-    "icon", "button", "link", "img", "src", "href", "data", "aria", "role", 
-    "svg", "xml", "lazy", "load", "loader", 
-    
-    # Scripting & Events
-    "function", "click", "event", "on", "handler", "widget", "js", "trigger", 
-    "track", "analytics", 
-    "name", "description", 
-    "type",
-"head",
-"title",
-
-"tag",
-"extracted", 
-"the", 
-"com"
-"a", 
-"https",
-"and",
-"blockname", 
-"tag", 
-# "strong", 
-"display", 
-"content", 
-"select", 
-"async", 
-"target", 
-"blank", 
-"lang", 
-"width", 
-"height", 
-"schema", 
-"embed", 
-"quote",
-"text", 
-"title", 
-"null", 
-"logo", 
-"article", 
-"context", 
-"publisher", 
-"symbol",
-
-"true",
-"page",
-"query",
-"false",
-"true",
-"nid",
-"author",
-"channel",
-"best",
-"buy",
-"summary",
-"large",
-"image",
-"term",
-"string",
-"search", 
-"subscribe",
-
-"sell",
-"personal",
-"privacy",
-"policy",
-"disclaimer",
-"service",
-"status",
-"all",
-"reserved",
 
 
-}
+with open("stopwords.json") as f:
+    data = json.load(f)
+
+
+HTML_ATTRIBUTE_STOP_WORDS = data['naive_stopwords']
+
+
+
 
 
 def retrieve_url_content(url, output_file_path):
-    """
-    Fetches the raw HTML content from the given URL and saves it to a file.
-    Returns True on success, False on failure.
-    """
     print(f"Attempting to retrieve content from: {url}")
     try:
-        # Set a User-Agent to mimic a browser, which helps prevent blocks
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
@@ -149,23 +51,11 @@ def retrieve_url_content(url, output_file_path):
 
 
 def clean_html_tags(input_file_path, output_file_path):
-    """
-    Reads HTML, applies targeted CSS removal, tag removal, filtering, 
-    writes the result, and prints metrics.
-    """
-
-    # 1. Read the raw HTML content
     with open(input_file_path, 'r', encoding='utf-8') as f:
         raw_html = f.read()
 
     initial_tokens = raw_html.split()
     initial_count = len(initial_tokens)
-
-    # -----------------------------------------------------------------
-    # NEW STEP 1: Targeted CSS Removal (The "Dynamic/CFG" Way)
-    # -----------------------------------------------------------------
-    # Pattern 1: Remove everything inside <style>...</style> blocks (non-greedy)
-    # re.DOTALL ensures '.' matches newlines, capturing multi-line CSS blocks.
     style_block_pattern = re.compile(r'<style.*?>(.*?)</style>', re.DOTALL | re.IGNORECASE)
     intermediate_html = re.sub(style_block_pattern, ' ', raw_html)
     
@@ -205,13 +95,9 @@ def clean_html_tags(input_file_path, output_file_path):
                     cleaned_text_list.append(word)
         
                     previous_word = word
-        
-    # 5. Write the cleaned list to the final output file
     output_content = '\n'.join(cleaned_text_list)
     with open(output_file_path, 'w', encoding='utf-8') as f:
         f.write(output_content)
-
-    # 6. Calculate and Print Metrics
     final_count = len(cleaned_text_list)
     removed_count = initial_count - final_count
 
@@ -223,11 +109,28 @@ def clean_html_tags(input_file_path, output_file_path):
     print(f"Cleaned output saved to: {output_file_path}")
     print("-" * 40)
 
-# --- Main Execution ---
-INPUT_FILE = 'raw_html_cache.txt' # Renamed for clarity: this holds the raw HTML
-OUTPUT_FILE = 'clean_text.txt'
-URL = "https://www.zacks.com/stock/news/2759433/is-flexshares-us-quality-large-cap-etf-qlc-a-strong-etf-right-now"
 
-# 1. Retrieve the URL content and save it to the input file
-if retrieve_url_content(URL, INPUT_FILE):
-    clean_html_tags(INPUT_FILE, OUTPUT_FILE)
+
+if __name__ == "__main__":
+
+
+        
+
+    parquet_file = "NEWS_20240101-142500_20251101-232422.parquet"
+
+    df = pd.read_parquet(parquet_file)
+
+
+    df_sorted = df.sort_values(by='time_published_ts', ascending=True)
+
+    print(df_sorted["url"].head())
+
+    INPUT_FILE = 'raw_html_cache.txt' 
+    OUTPUT_FILE = 'clean_text.txt'
+    URL = df_sorted["url"][0]
+
+    if retrieve_url_content(URL, INPUT_FILE):
+        clean_html_tags(INPUT_FILE, OUTPUT_FILE)
+
+
+
