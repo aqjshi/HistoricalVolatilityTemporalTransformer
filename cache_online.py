@@ -10,6 +10,9 @@ from nltk.corpus import words
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import math
+import hashlib # NEW: For generating content hash
+import secrets # Retained from your partial code
+import time 
 
 # --- 1. Setup NLTK and Word Lists ---
 try:
@@ -39,6 +42,11 @@ except KeyError:
 
 # --- 2. Worker Functions ---
 
+def generate_content_hash(content):
+    """Generates a short, unique hash based on the content."""
+    # Using SHA-256 and returning the first 16 characters for a short, unique ID
+    return hashlib.sha256(content.encode('utf-8')).hexdigest()[:16]
+
 def fetch_url(idx, url):
     """
     Worker function for threading. Fetches URL content.
@@ -62,7 +70,7 @@ def extract_potential_noise_words(raw_html, existing_stopwords):
     Cleans HTML and returns a list of words that are *not* English, 
     *not* tickers, and *not* already in the existing_stopwords set.
     """
-    
+    # ... (Unchanged cleaning and filtering logic) ...
     # 1. STEP 1: Remove Style blocks and attributes
     style_block_pattern = re.compile(r'<style.*?>(.*?)</style>', re.DOTALL | re.IGNORECASE)
     intermediate_html = re.sub(style_block_pattern, ' ', raw_html)
@@ -170,23 +178,34 @@ def print_frequency_report(title, counter, df_counter, total_documents, total_to
 if __name__ == "__main__":
     
     parquet_file = "NEWS_20240101-142500_20251101-232422.parquet"
+    NEW_PARQUET_FILE = "NEWS_HASHED_20240101-142500_20251101-232422.parquet" # NEW: Output parquet name
     NOISE_CACHE_FILE = "noise_tfidf_scores.json"
-
+    RAW_TEXT_DIR = "./texts" # NEW: Subdirectory for raw HTML
+    
+    # 1. Setup Data Structures and Directories
     try:
         df = pd.read_parquet(parquet_file)
     except FileNotFoundError:
         print(f"Error: Parquet file '{parquet_file}' not found.")
         sys.exit(1)
-        
+    
+    # Prepare DataFrame for saving hashes and track successful downloads
+    df['hash_id'] = None 
+    df['downloaded'] = False 
+    
+    # Create the output directory if it doesn't exist
+    os.makedirs(RAW_TEXT_DIR, exist_ok=True)
+    print(f"Created output directory: {RAW_TEXT_DIR}")
+    
     df_sorted = df.sort_values(by='time_published_ts', ascending=True)
 
     print(f"Loaded {len(df_sorted)} URLs from Parquet.")
     print(df_sorted["url"].head())
     
     # --- Batch Config ---
-    BATCH_SIZE = 2000  # Number of *new* items to add per batch
-    MAX_WORKERS = 32  # Number of concurrent download threads
-    MAX_RETRIES = 2    # Max *retries* (so 3 attempts total: 0, 1, 2)
+    BATCH_SIZE = 2000 
+    MAX_WORKERS = 20 
+    MAX_RETRIES = 2 
     
     # Holds (idx, url, retry_count) tuples
     pending_items = [] 
@@ -200,6 +219,10 @@ if __name__ == "__main__":
     total_rows = len(df_sorted)
     num_batches = math.ceil(total_rows / BATCH_SIZE)
     print(f"Total rows: {total_rows}. Batch size: {BATCH_SIZE}. Total batches: {num_batches}.")
+    
+    # Use a lock-free list for thread-safe hash updates (only writing is thread-safe, no reading contention)
+    # We will update the main dataframe at the end of the batch
+    batch_updates = [] 
 
     for i in range(num_batches):
         print(f"\n=== Starting Batch {i+1}/{num_batches} ===")
@@ -210,13 +233,14 @@ if __name__ == "__main__":
         current_batch_df = df_sorted.iloc[start_slice_idx:end_slice_idx]
         
         # Convert new items to (idx, url, retry_count=0)
+        # Note: We must use .loc to access the original index 'idx' correctly
         new_items_to_fetch = [(idx, row['url'], 0) for idx, row in current_batch_df.iterrows()]
         
         # Combine new items with any pending (failed) items
         items_to_try = pending_items + new_items_to_fetch
         print(f"Processing {len(items_to_try)} URLs ({len(pending_items)} pending, {len(new_items_to_fetch)} new)")
         
-        pending_items = [] # Will be repopulated with this batch's failures
+        pending_items = [] 
         fetched_results = [] # Will store (idx, url, content)
         
         # --- 2. Fetch all URLs in parallel ---
@@ -244,21 +268,31 @@ if __name__ == "__main__":
         print(f"Successfully fetched {len(fetched_results)} URLs this batch.")
         print(f"{len(pending_items)} URLs failed, will retry next batch.")
 
-        # --- 3. Process (clean) fetched results sequentially (CPU-bound) ---
-        batch_noise_counter = Counter()
-        total_batch_noise_tokens = 0
+        # --- 3. Process, Save, and Update Data Sequentially ---
         
-        print(f"Cleaning {len(fetched_results)} pages to find new noise words...")
+        print(f"Cleaning, saving raw HTML, and updating hash for {len(fetched_results)} pages...")
         for idx, url, content in fetched_results:
+            
+            # --- NEW STEP: Save Raw HTML and Generate Hash ---
+            content_hash = generate_content_hash(content)
+            filepath = os.path.join(RAW_TEXT_DIR, f"{content_hash}.txt")
+            
             try:
-                # Find new noise words
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                
+                # Store update information
+                batch_updates.append({'index': idx, 'hash_id': content_hash, 'downloaded': True})
+                
+            except Exception as e:
+                print(f"Error saving raw HTML for {url} (idx {idx}): {e}. Skipping content processing.")
+                continue # Skip processing if saving failed
+
+            # --- Noise Word Processing (Retained Logic) ---
+            try:
                 new_noise = extract_potential_noise_words(content, HTML_ATTRIBUTE_STOP_WORDS)
                 
                 if new_noise:
-                    # Update counters for this batch
-                    batch_noise_counter.update(new_noise)
-                    total_batch_noise_tokens += len(new_noise)
-                    
                     # Update aggregate counters (TF)
                     aggregate_noise_counter.update(new_noise)
                     total_aggregate_noise_tokens += len(new_noise)
@@ -272,20 +306,35 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"Error cleaning {url} (idx {idx}): {e}")
         
-        # --- 4. Print Per-Batch Report (Optional, can be removed for speed) ---
-        # The key accumulation happens above. We only run the full TF-IDF report at the end.
-        
-        
+        # --- End of Batch Update ---
+        # Apply the accumulated hash and download status updates to the main dataframe
+        for update in batch_updates:
+            df.loc[update['index'], 'hash_id'] = update['hash_id']
+            df.loc[update['index'], 'downloaded'] = update['downloaded']
+
+        # Clear batch updates list for the next iteration
+        batch_updates = []
+
+    
+    # --- Final Step: Save New Parquet File ---
     if pending_items:
         print(f"\n--- WARNING ---")
         print(f"{len(pending_items)} URLs failed all attempts and were not processed.")
 
-    # --- 5. Final Report and Caching ---
+    print("\n--- Saving Final Dataframes ---")
+    
+    # 1. Save the new Parquet file
+    df_output = df[df['downloaded'] == True].drop(columns=['downloaded'])
+    print(f"Saving new Parquet file with {len(df_output)} rows and 'hash_id' column...")
+    df_output.to_parquet(NEW_PARQUET_FILE, index=False)
+    print(f"✅ New Parquet file saved as: {NEW_PARQUET_FILE}")
+
+    # 2. Print Final Noise Report and Cache TF-IDF Scores
     print_frequency_report(
         "=== Final Aggregate Noise Report (All Batches - TF-IDF Score) ===",
         aggregate_noise_counter,
         document_frequency_counter,
         total_processed_documents,
         total_aggregate_noise_tokens,
-        output_filename=NOISE_CACHE_FILE # Pass the filename to save the scores
+        output_filename=NOISE_CACHE_FILE
     )
